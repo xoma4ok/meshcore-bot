@@ -18,6 +18,8 @@ my_position_lon = -122.3321
 
 # Daily forecast time
 weather_alarm = 6:00              # Or "sunrise" / "sunset"
+# weather_alarm = 6:00, 12:00, 18:00   # Multiple times per day
+# weather_alarm = every hour             # Or every 2 hours, every 30 minutes, @hourly
 
 # Channels
 weather_channel = #weather
@@ -37,7 +39,7 @@ alerts_channel = #weather
 enabled = true
 my_position_lat = 47.6062         # Your latitude (required)
 my_position_lon = -122.3321       # Your longitude (required)
-weather_alarm = 6:00              # Time for daily forecast (HH:MM or sunrise/sunset)
+weather_alarm = 6:00              # Time(s) for forecast (see Scheduling Options below)
 weather_channel = #weather        # Channel for forecasts
 alerts_channel = #weather         # Channel for weather alerts
 ```
@@ -47,6 +49,31 @@ alerts_channel = #weather         # Channel for weather alerts
 ```ini
 poll_weather_alerts_interval = 600000  # Check for alerts every 10 minutes (milliseconds)
 ```
+
+### Rain Nowcast (Proactive)
+
+Automatically posts a heads-up when rain is about to start at your position:
+
+```ini
+rain_nowcast_enabled = true            # Auto-announce incoming rain (opt-in; default: false)
+# rain_channel = #weather              # Defaults to weather_channel
+poll_rain_nowcast_interval = 900000    # Check every 15 minutes (milliseconds)
+rain_nowcast_lead_minutes = 60         # Only announce if rain starts within 60 min
+rain_nowcast_renotify_minutes = 30     # Cooldown between pushes
+# rain_nowcast_announce_ending = true  # Also announce when rain is about to stop
+# rain_nowcast_threshold_mm = 0.1      # Sensitivity (mm per 15-min bucket)
+```
+
+Posts both a **starting** heads-up (rain incoming) and, by default, an **ending**
+one (rain about to stop):
+
+```
+🌧️ Heads up — Rain starting in ~25min near Nashville, TN
+🌧️ Heads up — Rain ending in ~20min near Nashville, TN
+```
+
+Each fires once per rain episode. Set `rain_nowcast_announce_ending = false` to
+only announce incoming rain.
 
 ### Lightning Detection (Optional)
 
@@ -83,8 +110,29 @@ Sends forecast to `weather_channel` at configured time:
 
 **Scheduling Options:**
 - Fixed time: `weather_alarm = 6:00` (24-hour format)
+- Multiple times: `weather_alarm = 6:00, 12:00, 18:00`
+- Interval: `weather_alarm = every hour` (also `every 2 hours`, `every 30 minutes`, `@hourly`)
 - Sunrise: `weather_alarm = sunrise`
 - Sunset: `weather_alarm = sunset`
+
+### Rain Nowcast (Proactive)
+
+Watches your position and posts a heads-up to `rain_channel` (default: `weather_channel`) when precipitation is about to start, using Open-Meteo's 15-minutely forecast — the same engine as the [`rain`/`nowcast` command](command-reference.md#rain-location).
+
+**Example Output:**
+```
+🌧️ Heads up — Rain starting in ~25min near Seattle
+🌨️ Heads up — Snow starting in ~40min (steady) near Seattle
+```
+
+**How It Works:**
+1. Polls every `poll_rain_nowcast_interval` (default 15 min)
+2. Announces when rain is expected within `rain_nowcast_lead_minutes` (default 60)
+3. Fires **once per rain episode** — re-arms only after the forecast clears
+4. A `rain_nowcast_renotify_minutes` cooldown (default 30) absorbs forecast flapping
+5. `(steady)` marks prolonged rain (continues past the look-ahead window)
+
+Works worldwide (no API key). Set `rain_nowcast_enabled = false` to disable.
 
 ### Weather Alerts (US Only)
 

@@ -16,7 +16,6 @@ from typing import Any, Optional
 import ephem
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -30,9 +29,25 @@ except ImportError:
 
 import contextlib
 
+from ..commands.rain_command import (
+    analyze_precip_nowcast,
+    decide_rain_notification,
+    episode_probability_temp,
+    fetch_precip_series,
+    fetch_precip_series_nws,
+    format_amount_estimate,
+    join_location,
+    precip_descriptor,
+    reverse_geocode_region,
+)
 from ..url_shortener import shorten_url
 from ..utils import format_temperature_high_low, get_config_timezone
 from .base_service import BaseServicePlugin
+from .weather_alarm_schedule import (
+    WeatherAlarmSchedule,
+    build_forecast_cron_triggers,
+    parse_weather_alarm_schedule,
+)
 
 
 class WeatherService(BaseServicePlugin):
@@ -54,7 +69,8 @@ class WeatherService(BaseServicePlugin):
         super().__init__(bot)
 
         # Configuration
-        self.weather_alarm_time = self.bot.config.get('Weather_Service', 'weather_alarm', fallback='6:00')
+        self.weather_alarm_raw = self.bot.config.get('Weather_Service', 'weather_alarm', fallback='6:00')
+        self.weather_schedule = self._load_weather_schedule(self.weather_alarm_raw)
         self.my_position_lat = self.bot.config.getfloat('Weather_Service', 'my_position_lat', fallback=None)
         self.my_position_lon = self.bot.config.getfloat('Weather_Service', 'my_position_lon', fallback=None)
         self.weather_channel = self.bot.config.get('Weather_Service', 'weather_channel', fallback='general')
@@ -89,6 +105,24 @@ class WeatherService(BaseServicePlugin):
         self.wind_speed_unit = self.bot.config.get('Weather', 'wind_speed_unit', fallback='mph')
         self.precipitation_unit = self.bot.config.get('Weather', 'precipitation_unit', fallback='inch')
 
+        # Proactive rain nowcast ("rain incoming" push). Reuses the rain command's
+        # Open-Meteo 15-minutely logic for the bot's own position.
+        self.rain_nowcast_enabled = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_enabled', fallback=False)
+        self.rain_channel = self.bot.config.get('Weather_Service', 'rain_channel', fallback=self.weather_channel)
+        self.poll_rain_nowcast_interval = self.bot.config.getint('Weather_Service', 'poll_rain_nowcast_interval', fallback=900000) / 1000.0
+        self.rain_nowcast_lead_minutes = self.bot.config.getint('Weather_Service', 'rain_nowcast_lead_minutes', fallback=60)
+        self.rain_nowcast_renotify_minutes = self.bot.config.getint('Weather_Service', 'rain_nowcast_renotify_minutes', fallback=30)
+        self.rain_nowcast_threshold_mm = self.bot.config.getfloat('Weather_Service', 'rain_nowcast_threshold_mm', fallback=0.1)
+        # Also announce when rain is about to stop (not just start).
+        self.rain_nowcast_announce_ending = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_announce_ending', fallback=True)
+        # Optional precip-amount estimate in the heads-up, e.g. "(est 0.2 in)".
+        self.rain_nowcast_show_amount = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_show_amount', fallback=True)
+        self.rain_nowcast_amount_unit = self.bot.config.get('Weather_Service', 'rain_nowcast_amount_unit', fallback='in').strip().lower()
+        # Only push an "incoming" alert when precip is at least this likely (%), to
+        # cut false alarms; reuse a fetched series for this many seconds.
+        self.rain_nowcast_min_probability = self.bot.config.getint('Weather_Service', 'rain_nowcast_min_probability', fallback=50)
+        self.rain_nowcast_cache_seconds = self.bot.config.getint('Weather_Service', 'rain_nowcast_cache_seconds', fallback=300)
+
         # Track seen alerts to avoid duplicates
         self.seen_alert_ids: set[str] = set()
 
@@ -99,8 +133,19 @@ class WeatherService(BaseServicePlugin):
         self._alerts_task: Optional[asyncio.Task] = None
         self._forecast_task: Optional[asyncio.Task] = None
         self._lightning_task: Optional[asyncio.Task] = None
+        self._rain_task: Optional[asyncio.Task] = None
         self._forecast_scheduler: Optional[BackgroundScheduler] = None
         self._running = False
+
+        # Rain nowcast episode state (dedup): which notice has fired for the
+        # current rain episode, and the last-push timestamps (cooldown backstop).
+        self._rain_start_announced = False
+        self._rain_end_announced = False
+        self._last_rain_start_time: Optional[float] = None
+        self._last_rain_end_time: Optional[float] = None
+        # "City, ST" / "City, Country" for the proactive push (cached separately
+        # from the daily-forecast location name).
+        self._cached_rain_location: Optional[str] = None
 
         # Track recent lightning strikes to avoid duplicates
         self.recent_lightning_strikes: set[str] = set()
@@ -112,12 +157,29 @@ class WeatherService(BaseServicePlugin):
         self.mqtt_task: Optional[asyncio.Task] = None
 
         # Check if using sunrise/sunset
-        self.use_sunrise_sunset = self.weather_alarm_time.lower() in ['sunrise', 'sunset']
+        self.use_sunrise_sunset = self.weather_schedule.mode == 'sun_event'
 
         # Cache for location name (to avoid repeated reverse geocoding)
         self._cached_location_name: Optional[str] = None
 
-        self.logger.info(f"Weather service initialized: position=({self.my_position_lat}, {self.my_position_lon}), alarm={self.weather_alarm_time}")
+        self.logger.info(
+            "Weather service initialized: position=(%s, %s), alarm=%s",
+            self.my_position_lat,
+            self.my_position_lon,
+            self.weather_schedule.display,
+        )
+
+    def _load_weather_schedule(self, raw: str) -> WeatherAlarmSchedule:
+        """Load and validate weather forecast schedule from config."""
+        try:
+            return parse_weather_alarm_schedule(raw)
+        except ValueError as exc:
+            self.logger.warning(
+                "Invalid weather_alarm %r (%s), falling back to 6:00",
+                raw,
+                exc,
+            )
+            return parse_weather_alarm_schedule('6:00')
 
     def _load_weather_model(self) -> Optional[str]:
         """Load and normalize Open-Meteo model selection from config.
@@ -210,11 +272,17 @@ class WeatherService(BaseServicePlugin):
             # For sunrise/sunset, use a background task that reschedules daily
             self._forecast_task = asyncio.create_task(self._sunrise_sunset_forecast_loop())
         else:
-            # For fixed times, use APScheduler (BackgroundScheduler + daily cron)
-            self._setup_daily_forecast()
+            # For fixed times and intervals, use APScheduler cron jobs
+            self._setup_forecast_schedule()
 
         # Start background tasks
         self._alerts_task = asyncio.create_task(self._poll_weather_alerts_loop())
+
+        # Start proactive rain nowcast polling
+        if self.rain_nowcast_enabled:
+            self._rain_task = asyncio.create_task(self._poll_rain_nowcast_loop())
+        else:
+            self._rain_task = None
 
         # Start lightning detection if area is configured
         if self.blitz_area and MQTT_AVAILABLE:
@@ -252,6 +320,11 @@ class WeatherService(BaseServicePlugin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lightning_task
 
+        if self._rain_task:
+            self._rain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._rain_task
+
         if self.mqtt_task:
             self.mqtt_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -273,17 +346,9 @@ class WeatherService(BaseServicePlugin):
 
         self.logger.info("Weather service stopped")
 
-    def _setup_daily_forecast(self) -> None:
-        """Setup daily weather forecast schedule for fixed times (APScheduler cron, bot timezone)."""
+    def _setup_forecast_schedule(self) -> None:
+        """Setup weather forecast schedule (fixed times or intervals, bot timezone)."""
         try:
-            # Parse time (format: "HH:MM" or "H:MM")
-            if ':' in self.weather_alarm_time:
-                hour, minute = map(int, self.weather_alarm_time.split(':'))
-            else:
-                # Assume format "HHMM"
-                hour = int(self.weather_alarm_time[:2])
-                minute = int(self.weather_alarm_time[2:])
-
             if self._forecast_scheduler is not None:
                 try:
                     self._forecast_scheduler.shutdown(wait=False)
@@ -292,29 +357,31 @@ class WeatherService(BaseServicePlugin):
                 self._forecast_scheduler = None
 
             tz, _ = get_config_timezone(self.bot.config, self.logger)
+            triggers = build_forecast_cron_triggers(self.weather_schedule, tz)
             self._forecast_scheduler = BackgroundScheduler(timezone=tz)
-            self._forecast_scheduler.add_job(
-                self._send_daily_forecast,
-                CronTrigger(hour=hour, minute=minute),
-                id="weather_daily_forecast",
-                replace_existing=True,
-            )
+            for job_id, trigger, label in triggers:
+                self._forecast_scheduler.add_job(
+                    self._send_daily_forecast,
+                    trigger,
+                    id=job_id,
+                    replace_existing=True,
+                )
             self._forecast_scheduler.start()
+            labels = ", ".join(label for _, _, label in triggers)
             self.logger.info(
-                "Scheduled daily weather forecast at %02d:%02d (%s)",
-                hour,
-                minute,
+                "Scheduled weather forecast (%s) in %s",
+                labels,
                 getattr(tz, "zone", tz),
             )
         except Exception as e:
-            self.logger.error(f"Error setting up daily forecast schedule: {e}")
+            self.logger.error(f"Error setting up forecast schedule: {e}")
 
     async def _sunrise_sunset_forecast_loop(self) -> None:
         """Background task for sunrise/sunset-based forecasts.
 
         Calculates daily sunrise/sunset times and schedules the forecast accordingly.
         """
-        event_type = self.weather_alarm_time.lower()
+        event_type = self.weather_schedule.sun_event or 'sunrise'
         self.logger.info(f"Starting {event_type}-based forecast loop")
 
         while self._running:
@@ -765,6 +832,147 @@ class WeatherService(BaseServicePlugin):
 
         except Exception as e:
             self.logger.error(f"Error checking weather alerts: {e}")
+
+    async def _poll_rain_nowcast_loop(self) -> None:
+        """Background task: poll for incoming rain and push a heads-up once per episode."""
+        self.logger.info(
+            f"Starting rain nowcast polling (interval: {self.poll_rain_nowcast_interval}s, "
+            f"lead: {self.rain_nowcast_lead_minutes}min)"
+        )
+        while self._running:
+            try:
+                await self._check_rain_nowcast()
+                await asyncio.sleep(self.poll_rain_nowcast_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in rain nowcast polling loop: {e}")
+                await asyncio.sleep(60)  # Wait 1 minute on error before retrying
+
+    async def _check_rain_nowcast(self) -> None:
+        """Fetch the precip nowcast for the bot's position and push if rain is incoming."""
+        try:
+            loop = asyncio.get_event_loop()
+            # Prefer the NWS gridpoint (forecaster-adjusted QPF + PoP — it captures
+            # the convection the Open-Meteo model smooths away, which is why this
+            # push could stay silent during real rain). Fall back to Open-Meteo when
+            # NWS has no coverage (non-US) or the request fails.
+            series = await loop.run_in_executor(
+                None,
+                lambda: fetch_precip_series_nws(
+                    self.api_session,
+                    self.my_position_lat,
+                    self.my_position_lon,
+                    timeout=10,
+                    logger=self.logger,
+                    cache_ttl=self.rain_nowcast_cache_seconds,
+                ),
+            )
+            if not series:
+                series = await loop.run_in_executor(
+                    None,
+                    lambda: fetch_precip_series(
+                        self.api_session,
+                        self.my_position_lat,
+                        self.my_position_lon,
+                        weather_model=self.weather_model or "",
+                        timeout=10,
+                        logger=self.logger,
+                    ),
+                )
+            if not series:
+                return
+
+            # Look at least as far ahead as the lead window (plus a margin so we can
+            # estimate how long the rain lasts).
+            window = max(120, self.rain_nowcast_lead_minutes + 15)
+            result = analyze_precip_nowcast(
+                series["times"], series["precip"], series["codes"], series["now"],
+                window_minutes=window, threshold=self.rain_nowcast_threshold_mm,
+                current_precip=series.get("current_precip"), current_code=series.get("current_code"),
+                snow=series.get("snow"),
+            )
+            if result is None:
+                return
+
+            prob, temp_f = episode_probability_temp(series, result)
+            # Probability gate: skip a low-confidence "incoming" alert, and leave
+            # the announced flag unset so it can still fire if confidence rises.
+            if result.state == "dry_incoming" and prob is not None and prob < self.rain_nowcast_min_probability:
+                return
+
+            now_ts = time.time()
+            since_start = None if self._last_rain_start_time is None else (now_ts - self._last_rain_start_time)
+            since_end = None if self._last_rain_end_time is None else (now_ts - self._last_rain_end_time)
+            kind, self._rain_start_announced, self._rain_end_announced = decide_rain_notification(
+                result.state,
+                result.minutes,
+                lead_minutes=self.rain_nowcast_lead_minutes,
+                start_announced=self._rain_start_announced,
+                end_announced=self._rain_end_announced,
+                seconds_since_last_start=since_start,
+                seconds_since_last_end=since_end,
+                renotify_minutes=self.rain_nowcast_renotify_minutes,
+                announce_ending=self.rain_nowcast_announce_ending,
+            )
+            if kind is None:
+                return
+
+            message = await self._format_rain_nowcast(result, kind, prob, temp_f)
+            await self.bot.command_manager.send_channel_message(
+                self.rain_channel,
+                message,
+                scope=self.get_mesh_flood_scope(),
+            )
+            if kind == "starting":
+                self._last_rain_start_time = now_ts
+            else:
+                self._last_rain_end_time = now_ts
+            self.logger.info(f"Rain nowcast ({kind}) sent to {self.rain_channel}: {message}")
+
+        except Exception as e:
+            self.logger.error(f"Error checking rain nowcast: {e}")
+
+    async def _format_rain_nowcast(
+        self, result: Any, kind: str, prob: Optional[int] = None, temp_f: Optional[int] = None
+    ) -> str:
+        """Build the proactive heads-up line (English, mesh-friendly).
+
+        kind is "starting" (rain incoming) or "ending" (rain about to stop).
+        prob/temp_f add a probability and a borderline-temperature tag.
+        """
+        emoji, ptype = precip_descriptor(result.bucket)
+
+        # City + state/country (same labeling as the !rain command), reverse-
+        # geocoded once and cached. Kept separate from the daily-forecast cache.
+        if self._cached_rain_location is None:
+            loop = asyncio.get_event_loop()
+            city, suffix = await loop.run_in_executor(
+                None,
+                lambda: reverse_geocode_region(
+                    self.bot, self.my_position_lat, self.my_position_lon, timeout=10, logger=self.logger
+                ),
+            )
+            self._cached_rain_location = join_location(city, suffix)
+        location = f" near {self._cached_rain_location}" if self._cached_rain_location else ""
+
+        parts = []
+        if self.rain_nowcast_show_amount:
+            amt = format_amount_estimate(
+                result.bucket, result.amount_mm, result.snow_cm, self.rain_nowcast_amount_unit
+            )
+            if amt:
+                parts.append(f"est {amt}")
+        if prob is not None:
+            parts.append(f"{prob}%")
+        est = f" ({', '.join(parts)})" if parts else ""
+        temp = f" {temp_f}°F" if (temp_f is not None and 30 <= temp_f <= 38) else ""
+        if kind == "ending":
+            return f"{emoji} Heads up — {ptype} ending in ~{result.minutes}min{est}{temp}{location}"
+        # Flag prolonged rain ("steady") rather than a numeric duration, which
+        # would sit confusingly next to the minutes-until-start value.
+        steady = " (steady)" if result.open_ended else ""
+        return f"{emoji} Heads up — {ptype} starting in ~{result.minutes}min{est}{steady}{temp}{location}"
 
     async def _connect_blitzortung_mqtt(self) -> None:
         """Connect to Blitzortung MQTT broker and subscribe to lightning data.
