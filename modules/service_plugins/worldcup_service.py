@@ -189,7 +189,7 @@ class WorldCupLiveService(BaseServicePlugin):
         changed = False
         for m in matches:
             eid = m["id"]
-            cur = {"h": m["home_score"], "a": m["away_score"], "s": m["status"]}
+            cur = {"h": m["home_score"], "a": m["away_score"], "s": m["status"], "g": len(m.get("goals") or [])}
             prev = self._state.get(eid)
             if prev is None:
                 # First sight: seed silently so in-progress matches aren't back-announced.
@@ -226,10 +226,37 @@ class WorldCupLiveService(BaseServicePlugin):
             return self._score_line(label, m, cur, "full-time")
         if self.announce_halftime and cs == HT_STATUS and ps != HT_STATUS:
             return self._score_line(label, m, cur, "half-time")
-        if self.announce_goals and (cur["h"], cur["a"]) != (prev["h"], prev["a"]) and cs in PLAYING_STATUSES:
-            clock = (m.get("clock") or "").strip()
-            return self._score_line(label, m, cur, clock or None)
+        if (
+            self.announce_goals
+            and (cur["h"] + cur["a"]) > (prev["h"] + prev["a"])  # a goal was added (not a VAR removal)
+            and cs in PLAYING_STATUSES
+        ):
+            return self._score_line(label, m, cur, self._goal_tag(prev, m))
         return None
+
+    def _goal_tag(self, prev: dict, m: dict) -> Optional[str]:
+        """Build the parenthetical tag for a goal: scorer(s) since last poll, else the clock."""
+        goals = m.get("goals") or []
+        # Only name scorers when we have a known prior count to diff against; otherwise the
+        # whole list would look "new" (e.g. on the first poll after an upgrade).
+        if "g" in prev and len(goals) >= prev["g"]:
+            new_goals = goals[prev["g"]:]
+            if new_goals:
+                return "; ".join(self._fmt_goal(g) for g in new_goals)
+        clock = (m.get("clock") or "").strip()
+        return clock or None
+
+    @staticmethod
+    def _fmt_goal(goal: dict) -> str:
+        """Format one scoring play, e.g. \"64' Mohammad Mohebbi\" or \"7' Elijah Just, pen\"."""
+        clock = (goal.get("clock") or "").strip()
+        name = goal.get("scorer") or "?"
+        text = f"{clock} {name}".strip()
+        if goal.get("own_goal"):
+            text += ", OG"
+        elif goal.get("penalty"):
+            text += ", pen"
+        return text
 
     def _score_line(self, label: str, m: dict, cur: dict, tag: Optional[str]) -> str:
         line = f"{label}: {m['home_name']} {cur['h']}, {m['away_name']} {cur['a']}"

@@ -35,12 +35,16 @@ def _svc(**overrides):
 
 
 def _match(eid="1", h=0, a=0, status="STATUS_SCHEDULED", clock="", hp=None, ap=None,
-           hid="100", aid="200", hn="Côte d'Ivoire", an="Ecuador"):
+           hid="100", aid="200", hn="Côte d'Ivoire", an="Ecuador", goals=None):
     return {
         "id": eid, "home_id": hid, "away_id": aid, "home_name": hn, "away_name": an,
         "home_score": h, "away_score": a, "status": status, "clock": clock,
-        "home_pen": hp, "away_pen": ap,
+        "home_pen": hp, "away_pen": ap, "goals": goals or [],
     }
+
+
+def _goal(clock, scorer, own_goal=False, penalty=False, team_id="100"):
+    return {"clock": clock, "scorer": scorer, "team_id": team_id, "own_goal": own_goal, "penalty": penalty}
 
 
 GROUPS = {"100": "Group E", "200": "Group E"}
@@ -62,6 +66,39 @@ class TestDetect:
         prev = {"h": 0, "a": 0, "s": "STATUS_FIRST_HALF"}
         m = _match(h=1, a=0, status="STATUS_FIRST_HALF", clock="23'")
         assert self._detect(svc, prev, m) == "Group E: Côte d'Ivoire 1, Ecuador 0 (23')"
+
+    def test_goal_names_new_scorer(self):
+        svc = _svc()
+        prev = {"h": 0, "a": 0, "s": "STATUS_FIRST_HALF", "g": 0}
+        m = _match(h=1, a=0, status="STATUS_FIRST_HALF", clock="7'",
+                   goals=[_goal("7'", "Elijah Just")])
+        assert self._detect(svc, prev, m) == "Group E: Côte d'Ivoire 1, Ecuador 0 (7' Elijah Just)"
+
+    def test_goal_penalty_annotation(self):
+        svc = _svc()
+        prev = {"h": 1, "a": 0, "s": "STATUS_SECOND_HALF", "g": 1}
+        m = _match(h=1, a=1, status="STATUS_SECOND_HALF", clock="64'",
+                   goals=[_goal("7'", "Elijah Just"), _goal("64'", "Ramin Rezaeian", penalty=True, team_id="200")])
+        assert self._detect(svc, prev, m) == "Group E: Côte d'Ivoire 1, Ecuador 1 (64' Ramin Rezaeian, pen)"
+
+    def test_goal_multiple_since_last_poll(self):
+        svc = _svc()
+        prev = {"h": 0, "a": 0, "s": "STATUS_FIRST_HALF", "g": 0}
+        m = _match(h=2, a=0, status="STATUS_FIRST_HALF", clock="20'",
+                   goals=[_goal("7'", "A. One"), _goal("20'", "B. Two")])
+        assert self._detect(svc, prev, m) == "Group E: Côte d'Ivoire 2, Ecuador 0 (7' A. One; 20' B. Two)"
+
+    def test_goal_falls_back_to_clock_without_details(self):
+        svc = _svc()
+        prev = {"h": 0, "a": 0, "s": "STATUS_FIRST_HALF", "g": 0}
+        m = _match(h=1, a=0, status="STATUS_FIRST_HALF", clock="12'")  # no goals payload
+        assert self._detect(svc, prev, m) == "Group E: Côte d'Ivoire 1, Ecuador 0 (12')"
+
+    def test_var_removed_goal_not_announced(self):
+        svc = _svc()
+        prev = {"h": 1, "a": 0, "s": "STATUS_FIRST_HALF", "g": 1}
+        m = _match(h=0, a=0, status="STATUS_FIRST_HALF", clock="15'", goals=[])
+        assert self._detect(svc, prev, m) is None
 
     def test_halftime(self):
         svc = _svc()

@@ -157,9 +157,12 @@ class ESPNClient:
         """Return current per-match live state for the scoreboard (today's matches).
 
         Each item: {id, home_id, away_id, home_name, away_name, home_score, away_score,
-        status, clock, home_pen, away_pen}. Names are full team display names. Penalty
-        fields are None unless a shootout score is present. Used by the live-score service
-        to detect kickoff / goal / half-time / full-time transitions. Returns [] on error.
+        status, clock, home_pen, away_pen, goals}. Names are full team display names.
+        Penalty fields are None unless a shootout score is present. ``goals`` is the
+        chronological list of scoring plays, each {clock, scorer, team_id, own_goal,
+        penalty} (penalty shootout kicks excluded). Used by the live-score service to
+        detect kickoff / goal / half-time / full-time transitions and name scorers.
+        Returns [] on error.
 
         cache_bust appends a unique query param to bypass ESPN's edge cache, used when a
         fastcast push signals a change so the REST snapshot reflects it immediately.
@@ -182,6 +185,20 @@ class ESPNClient:
                     home = next((c for c in competitors if c.get('homeAway') == 'home'), competitors[0])
                     away = next((c for c in competitors if c.get('homeAway') == 'away'), competitors[1])
                     status_obj = competition.get('status', event.get('status', {}))
+
+                    goals = []
+                    for det in competition.get('details', []):
+                        if not det.get('scoringPlay') or det.get('shootout'):
+                            continue
+                        athletes = det.get('athletesInvolved') or []
+                        goals.append({
+                            'clock': det.get('clock', {}).get('displayValue', ''),
+                            'scorer': athletes[0].get('displayName', '') if athletes else '',
+                            'team_id': str(det.get('team', {}).get('id', '')),
+                            'own_goal': bool(det.get('ownGoal')),
+                            'penalty': bool(det.get('penaltyKick')),
+                        })
+
                     states.append({
                         'id': str(event.get('id', '')),
                         'home_id': str(home.get('team', {}).get('id', '')),
@@ -194,6 +211,7 @@ class ESPNClient:
                         'clock': status_obj.get('displayClock', ''),
                         'home_pen': self.extract_shootout_score(home),
                         'away_pen': self.extract_shootout_score(away),
+                        'goals': goals,
                     })
                 return states
         except Exception as e:
