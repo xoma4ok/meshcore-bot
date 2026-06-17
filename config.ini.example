@@ -2163,3 +2163,83 @@ enabled = false
 # api_url = https://example.com/checkins
 # api_key = YOUR_API_KEY
 # Or set CHECKIN_API_KEY in the environment (takes precedence).
+
+# -----------------------------------------------------------------------------
+# Telegram Alert Service
+# Monitors Telegram channels via the MTProto user-account API (Telethon) and
+# relays messages matching configured regex patterns to a MeshCore mesh channel.
+# Requires: pip install telethon
+#
+# WHY A PHONE NUMBER IS REQUIRED (not a bot token)
+# ─────────────────────────────────────────────────
+# Telegram bots can only receive messages from channels where the bot has been
+# added as an administrator.  For public channels that you do not control this
+# is not possible.  Reading such channels requires a regular Telegram *user*
+# account authenticated via the MTProto API — which Telethon implements.
+# A bot token alone cannot subscribe to arbitrary public channels.
+#
+# HOW TO OBTAIN THE REQUIRED PARAMETERS
+# ──────────────────────────────────────
+# 1. api_id and api_hash
+#    a. Open https://my.telegram.org/apps in a browser.
+#    b. Log in with the Telegram account you want to use (phone + OTP).
+#    c. Click "Create application" (name and platform do not matter).
+#    d. Copy "App api_id" (a short integer) and "App api_hash" (a hex string).
+#    These credentials identify your Telegram *application*, not your account.
+#
+# 2. Phone number
+#    Enter the phone number of the Telegram account in international format,
+#    e.g.  +15551234567.  This is only needed for the *first* run.
+#
+# FIRST-RUN AUTHORISATION
+# ───────────────────────
+# When the bot starts for the first time it will print a prompt in the console
+# asking for the one-time password (OTP) sent to your Telegram app.
+# After you enter the OTP, Telethon saves a session file
+# (tg_alert_service_session_name + ".session") next to the bot.
+# On every subsequent run the session file is reused automatically —
+# no phone number or OTP is required again.  You may then remove
+# tg_alert_service_phone from the config (or leave it; it is ignored
+# once the session file exists).
+# -----------------------------------------------------------------------------
+[Tg_Alert_Service]
+enabled = false
+
+# Telegram app credentials — obtain at https://my.telegram.org/apps
+tg_alert_service_api_id = 0
+tg_alert_service_api_hash =
+
+# Phone number of the Telegram account in international format (e.g. +15551234567).
+# Required only for the first run to create the session file.
+# Can be removed or left blank after successful first-time authorisation.
+tg_alert_service_phone =
+
+# Telethon session file name (no .session extension; stored in the bot working directory).
+# Default: tg_alert_session  →  saves as tg_alert_session.session
+tg_alert_service_session_name = tg_alert_session
+
+# Comma-separated Telegram channel usernames or numeric IDs to monitor.
+# Public channels: use the @username shown in the channel link.
+# Private channels you are a member of: use the numeric ID (e.g. -1001234567890).
+tg_alert_service_channels = @example_channel1, @example_channel2
+
+# MeshCore channel name to relay matching messages to (e.g. #warning, #alerts)
+tg_alert_service_meshcore_channel = #warning
+
+# Comma-separated regex patterns — a message is relayed when ANY pattern matches (OR logic).
+# Each entry is treated as an independent pattern; you may also use | inside a single entry.
+# Matching is case-insensitive.
+# Examples:
+#   tg_alert_service_patterns = warning|alert, emergency, \bfire\b
+tg_alert_service_patterns = warning|alert, emergency
+
+# Maximum characters per MeshCore message chunk (default 120).
+# Messages longer than this are split on word boundaries.
+tg_alert_service_max_chunk_len = 120
+
+# Pause in seconds between consecutive chunks when a message is split (default 2).
+tg_alert_service_chunk_delay = 2
+
+# Optional: regional flood scope when sending to MeshCore (e.g. #west).
+# Leave blank to use the global [Channels] outgoing_flood_scope_override or global flood.
+# flood_scope =
