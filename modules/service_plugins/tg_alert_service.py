@@ -76,7 +76,15 @@ class TgAlertService(BaseServicePlugin):
         cfg = self.bot.config
         section = self.config_section
 
-        self._api_id: int = cfg.getint(section, "tg_alert_service_api_id", fallback=0)
+        try:
+            self._api_id: int = cfg.getint(section, "tg_alert_service_api_id", fallback=0)
+        except ValueError:
+            self.logger.error(
+                "tg_alert_service: tg_alert_service_api_id must be an integer (got %r)",
+                cfg.get(section, "tg_alert_service_api_id", fallback=""),
+            )
+            self.enabled = False
+            return
         self._api_hash: str = cfg.get(section, "tg_alert_service_api_hash", fallback="").strip()
         self._session_name: str = cfg.get(
             section, "tg_alert_service_session_name", fallback="tg_alert_session"
@@ -104,12 +112,17 @@ class TgAlertService(BaseServicePlugin):
                 self.enabled = False
                 return
 
-        self._max_chunk_len: int = cfg.getint(
-            section, "tg_alert_service_max_chunk_len", fallback=120
-        )
-        self._chunk_delay: float = cfg.getfloat(
-            section, "tg_alert_service_chunk_delay", fallback=2.0
-        )
+        try:
+            self._max_chunk_len: int = cfg.getint(
+                section, "tg_alert_service_max_chunk_len", fallback=120
+            )
+            self._chunk_delay: float = cfg.getfloat(
+                section, "tg_alert_service_chunk_delay", fallback=2.0
+            )
+        except ValueError as exc:
+            self.logger.error("tg_alert_service: invalid numeric config value: %s", exc)
+            self.enabled = False
+            return
 
         if not self._api_id or not self._api_hash:
             self.logger.error(
@@ -138,11 +151,12 @@ class TgAlertService(BaseServicePlugin):
 
         self.logger.info(
             "TgAlertService initialized: channels=%s, meshcore_channel=%s, "
-            "max_chunk_len=%d, chunk_delay=%.1fs",
+            "max_chunk_len=%d, chunk_delay=%.1fs, patterns=%s",
             self._channels,
             self._meshcore_channel,
             self._max_chunk_len,
             self._chunk_delay,
+            raw_patterns,
         )
 
     async def start(self) -> None:
@@ -150,7 +164,11 @@ class TgAlertService(BaseServicePlugin):
             return
         self._running = True
         self._task = asyncio.create_task(self._run())
-        self.logger.info("TgAlertService started")
+        self.logger.info(
+            "TgAlertService started: watching %s -> %s",
+            self._channels,
+            self._meshcore_channel,
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -169,20 +187,38 @@ class TgAlertService(BaseServicePlugin):
 
     async def _run(self) -> None:
         """Main loop: connect Telethon client and listen for new messages."""
+        self.logger.info("TgAlertService: _run loop entered")
         while self._running:
             try:
+                self.logger.info("TgAlertService: attempting Telegram connection...")
                 await self._connect_and_listen()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                self.logger.error("TgAlertService error: %s — reconnecting in 30s", exc)
+                self.logger.error(
+                    "TgAlertService error: %s — reconnecting in 30s", exc, exc_info=True
+                )
                 await asyncio.sleep(30)
 
     async def _connect_and_listen(self) -> None:
+        self.logger.info(
+            "TgAlertService: creating TelegramClient (session=%s, api_id=%s)",
+            self._session_name,
+            self._api_id,
+        )
         client = TelegramClient(self._session_name, self._api_id, self._api_hash)
         self._client = client
 
-        await client.start(phone=self._phone if self._phone else None)
+        try:
+            await client.start(phone=self._phone if self._phone else None)
+        except Exception as exc:
+            self.logger.error(
+                "TgAlertService: failed to connect to Telegram: %s "
+                "(check api_id, api_hash, phone number, and session file)",
+                exc,
+                exc_info=True,
+            )
+            raise
         self.logger.info("TgAlertService: connected to Telegram")
 
         # Resolve channel entities once so we can filter by chat
@@ -193,7 +229,12 @@ class TgAlertService(BaseServicePlugin):
                 resolved.append(entity)
                 self.logger.info("TgAlertService: subscribed to channel %s (id=%s)", ch, entity.id)
             except Exception as exc:
-                self.logger.warning("TgAlertService: cannot resolve channel %r: %s", ch, exc)
+                self.logger.error(
+                    "TgAlertService: failed to subscribe to channel %r: %s "
+                    "(check that the channel exists and the account has access)",
+                    ch,
+                    exc,
+                )
 
         if not resolved:
             self.logger.error("TgAlertService: no channels resolved, aborting")
@@ -207,7 +248,9 @@ class TgAlertService(BaseServicePlugin):
             if not self._compiled_pattern or not self._compiled_pattern.search(text):
                 return
             self.logger.info(
-                "TgAlertService: match in chat %s: %s…", event.chat_id, text[:60]
+                "TgAlertService: pattern matched in chat %s — full text: %s",
+                event.chat_id,
+                text,
             )
             await self._relay_to_meshcore(text)
 
@@ -223,6 +266,10 @@ class TgAlertService(BaseServicePlugin):
     async def _relay_to_meshcore(self, text: str) -> None:
         """Split text into chunks and send to the configured MeshCore channel."""
         chunks = self._split_text(text, self._max_chunk_len)
+        total = len(chunks)
+        self.logger.info(
+            "TgAlertService: relaying to %s — %d chunk(s)", self._meshcore_channel, total
+        )
         for i, chunk in enumerate(chunks):
             if i > 0 and self._chunk_delay > 0:
                 await asyncio.sleep(self._chunk_delay)
@@ -233,8 +280,15 @@ class TgAlertService(BaseServicePlugin):
                     skip_user_rate_limit=True,
                     scope=self.get_mesh_flood_scope(),
                 )
+                self.logger.info(
+                    "TgAlertService: sent chunk %d/%d to %s: %s",
+                    i + 1,
+                    total,
+                    self._meshcore_channel,
+                    chunk,
+                )
             except Exception as exc:
-                self.logger.error("TgAlertService: failed to send chunk %d: %s", i + 1, exc)
+                self.logger.error("TgAlertService: failed to send chunk %d/%d: %s", i + 1, total, exc)
 
     @staticmethod
     def _split_text(text: str, max_len: int) -> list[str]:

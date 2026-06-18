@@ -182,3 +182,8 @@ local/service_plugins/*
 !local/service_plugins/.gitkeep
 
 .claude/settings.local.json
+
+# Docker image exports
+*.tar
+*.tar.gz
+*.zip

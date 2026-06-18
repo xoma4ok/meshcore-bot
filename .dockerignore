@@ -43,6 +43,10 @@ Thumbs.db
 logs/
 backups/
 *.ini
+*.session
+*.tar
+*.tar.gz
+*.zip
 config.ini
 config.ini.example
 config.ini.minimal-example
