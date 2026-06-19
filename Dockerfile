@@ -27,7 +27,7 @@ COPY requirements.txt pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/pip,id=pip-$TARGETARCH \
     export LIBSODIUM_MAKE_ARGS="-j$(nproc)" && \
     pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install --user -r requirements.txt
 
 # ── runtime stage ──────────────────────────────────────────────────────────
 FROM python:3.12-slim
