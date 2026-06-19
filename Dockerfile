@@ -2,7 +2,7 @@
 # Supports: linux/amd64, linux/arm64 (RPi 4/5, 64-bit OS), linux/arm/v7 (RPi 3, 32-bit OS)
 
 # ── builder stage ──────────────────────────────────────────────────────────
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 # TARGETPLATFORM is injected by BuildKit for each platform in the matrix.
 # Useful for platform-specific build steps if needed in future.
@@ -25,10 +25,12 @@ COPY requirements.txt pyproject.toml ./
 
 # Pip cache is scoped per-architecture.
 RUN --mount=type=cache,target=/root/.cache/pip,id=pip-$TARGETARCH \
-    pip install --user -r requirements.txt
+    export LIBSODIUM_MAKE_ARGS="-j$(nproc)" && \
+    pip install --upgrade pip && \
+    pip install -r requirements.txt
 
 # ── runtime stage ──────────────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ARG TARGETARCH
 
